@@ -1,6 +1,8 @@
+from typing import Optional
 from transformers import PretrainedConfig
 import torch
 import torch.nn as nn
+import math
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -83,3 +85,45 @@ class RMSNorm(nn.Module):
     
     def forward(self, x):
         return self.weight*self._norm(x.float()).type_as(x)*x
+    
+def precompute_freqs_cis(dim:int, end:int=32*1024, rope_base:float=1e6, rope_scaling:Optional[dict]=None):
+    freqs, attn_factor = (1.0/(rope_base**(torch.arange(0, dim, 2)[:(dim//2)].float()/dim)), 1.0)
+
+    if rope_scaling is not None:
+        orig_max, factor, beta_fast, beta_slow = (
+            rope_scaling["original_max_position_embeddings"],
+            rope_scaling["factor"],
+            rope_scaling["beta_fast"],
+            rope_scaling["beta_slow"],
+        )
+
+        if end > orig_max:
+            inv_dim = lambda b:(dim*math.log(orig_max/(b*2*math.pi)))/(2*math.log(rope_base))
+            low, high = (max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim//2 - 1))
+
+            ramp = torch.clamp(
+                (torch.arange(dim // 2, device=freqs.device).float() - low)
+                /max(high - low, 1e-3),
+                0,
+                1
+            )
+
+            freqs = freqs*(1-ramp+ramp/factor)
+        
+    t = torch.arange(end, device=freqs.device).float()
+    freqs = torch.outer(t, freqs).float()
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)*attn_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)*attn_factor 
+
+    return freqs_cos, freqs_sin
+    
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    def rotate_half(x):
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat([-x2, x1], dim=-1)
+    q_embed = rotate_half(q)
+    k_embed = rotate_half(k)
+    q = q * cos.unsqueeze(unsqueeze_dim) + q_embed * sin.unsqueeze(unsqueeze_dim)
+    k = k * cos.unsqueeze(unsqueeze_dim) + k_embed * sin.unsqueeze(unsqueeze_dim)
+
+    return q, k

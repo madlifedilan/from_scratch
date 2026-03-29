@@ -3,6 +3,7 @@ from einops import rearrange, repeat
 from transformers import PretrainedConfig
 import torch
 import torch.nn as nn
+from torch import Tensor
 import torch.nn.functional as F
 import math
 
@@ -35,9 +36,9 @@ class MiniMindConfig(PretrainedConfig):
         aux_loss_alpha: float = 0.01,
         seq_aux: bool = True,
         norm_topk_prob: bool = True,
-        **kwargs,
+        **kwconfig,
     ):
-        super().__init__(**kwargs)
+        super().__init__(**kwconfig)
 
         self.dropout = dropout
         self.bos_token_id = bos_token_id
@@ -90,7 +91,12 @@ class RMSNorm(nn.Module):
         return self.weight*self._norm(x.float()).type_as(x)*x
     
 def precompute_freqs_cis(dim:int, end:int=32*1024, rope_base:float=1e6, rope_scaling:Optional[dict]=None):
-    freqs, attn_factor = (1.0/(rope_base**(torch.arange(0, dim, 2)[:(dim//2)].float()/dim)), 1.0)
+    """
+    freqs_cos: (seq, dim)
+    freqs_sin: (seq, dim)
+    """
+    freqs= 1.0/(rope_base**(torch.arange(0, dim, 2)[:(dim//2)].float()/dim))
+    attn_factor = 1.0
 
     if rope_scaling is not None:
         orig_max, factor, beta_fast, beta_slow = (
@@ -120,18 +126,20 @@ def precompute_freqs_cis(dim:int, end:int=32*1024, rope_base:float=1e6, rope_sca
 
     return freqs_cos, freqs_sin
     
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def apply_rotary_pos_emb(q, k, cos:Tensor, sin:Tensor, position_ids=None):
     """
     q, k: (b, seq, h, d)
     cos, sin: (seq, dim)
     """
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
     def rotate_half(x):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat([-x2, x1], dim=-1)
     q_embed = rotate_half(q)
     k_embed = rotate_half(k)
-    q = q * cos.unsqueeze(unsqueeze_dim) + q_embed * sin.unsqueeze(unsqueeze_dim)
-    k = k * cos.unsqueeze(unsqueeze_dim) + k_embed * sin.unsqueeze(unsqueeze_dim)
+    q = q * cos + q_embed * sin
+    k = k * cos + k_embed * sin
 
     return q, k
 
@@ -143,24 +151,24 @@ def repeat_kv(x, num_repeats):
     return x
 
 class Attention(nn.Module):
-    def __init__(self, args:MiniMindConfig):
+    def __init__(self, config:MiniMindConfig):
         super().__init__()
-        self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads else args.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads if config.num_key_value_heads else config.num_attention_heads
         
-        assert args.num_attention_heads % self.num_key_value_heads == 0,"num_attention_heads must be divisible by num_key_value_heads"
+        assert config.num_attention_heads % self.num_key_value_heads == 0,"num_attention_heads must be divisible by num_key_value_heads"
 
-        self.n_local_heads = args.num_attention_heads
+        self.n_local_heads = config.num_attention_heads
         self.n_rep = self.n_local_heads//self.num_key_value_heads
-        self.head_dim = args.hidden_size//args.num_attention_heads
+        self.head_dim = config.hidden_size//config.num_attention_heads
 
-        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads*self.head_dim, bias=False)
-        self.k_proj = nn.Linear(args.hidden_size, args.num_key_value_heads*self.head_dim, bias=False)
-        self.v_proj = nn.Linear(args.hidden_size, args.num_key_value_heads*self.head_dim, bias=False)
-        self.o_proj = nn.Linear(args.num_attention_heads*self.head_dim, args.hidden_size, bias=False)
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads*self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads*self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads*self.head_dim, bias=False)
+        self.o_proj = nn.Linear(config.num_attention_heads*self.head_dim, config.hidden_size, bias=False)
 
-        self.flash_attn = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attention
+        self.flash_attn = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attention
 
-    def forward(self, x:torch.Tensor, position_embedding:tuple, past_key_value:Optional[tuple]=None, use_cache:bool=False, attn_mask:Optional[torch.Tensor]=None):
+    def forward(self, x:Tensor, position_embedding:tuple, past_key_value:Optional[tuple]=None, use_cache:bool=False, attn_mask:Optional[Tensor]=None):
         """
         x: (b, seq, dim)
         position_embedding: tuple of (cos, sin) each of shape (seq, dim)
@@ -200,22 +208,73 @@ class Attention(nn.Module):
         return out, past_kv
     
 
-def SiLU(x: torch.Tensor):
+def SiLU(x: Tensor):
     in_type = x.dtype
     x = x.to(torch.float32)
     return (x * torch.sigmoid(x)).to(in_type)
 
 class FeedForward(nn.Module):
-    def __init__(self, args:MiniMindConfig):
+    def __init__(self, config:MiniMindConfig):
         super().__init__()
-        if args.intermediate_size is None:
-            intermediate_size = int(args.hidden_size*8/3)
-            args.intermediate_size = 64*((intermediate_size + 63) // 64)
+        if config.intermediate_size is None:
+            intermediate_size = int(config.hidden_size*8/3)
+            config.intermediate_size = 64*((intermediate_size + 63) // 64)
 
-        self.fc1 = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.fc2 = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
-        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.act_fn = SiLU
 
-    def forward(self, x:torch.Tensor):
+    def forward(self, x:Tensor):
         return self.fc2(self.act_fn(self.fc1(x))*self.gate_proj(x))
+
+class Block(nn.Module):
+    def __init__(self, layer_id:int, config:MiniMindConfig):
+        super().__init__()
+        self.attn = Attention(config)
+        self.ffn = FeedForward(config)
+        self.norm1 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm2 = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layer_id = layer_id
+
+    def forward(self, x:Tensor, position_embedding:tuple, past_key_value:Optional[tuple]=None, use_cache:bool=False, attn_mask:Optional[Tensor]=None):
+        attn_out, past_kv = self.attn(self.norm1(x), position_embedding, past_key_value, use_cache, attn_mask)
+        x = x + attn_out
+        x = x + self.ffn(self.norm2(x))
+        return x, past_kv
+    
+class MiniMind(nn.Module):
+    def __init__(self, config:MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.tok_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([Block(i, config) for i in range(config.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.output_proj = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.freqs_cos, self.freqs_sin = precompute_freqs_cis(config.hidden_size//config.num_attention_heads, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
+    
+    def forward(self, input_ids:Tensor, position_ids:Optional[Tensor]=None, past_key_values:Optional[list]=None, use_cache:bool=False, attn_mask:Optional[Tensor]=None):
+        if hasattr(past_key_values, 'layers'):
+            past_key_values = None
+        
+        b, seq = input_ids.shape
+        device = input_ids.device   
+
+        past_key_values = past_key_values if past_key_values is not None else [None]*len(self.layers)
+
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        position_embedding = (self.freqs_cos[start_pos:start_pos+seq], self.freqs_sin[start_pos:start_pos+seq]) if self.freqs_cos is not None else None
+
+        hidden_states = self.tok_embeddings(input_ids)
+
+        presents = []
+
+
+        for idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
+            hidden_states, present = layer(hidden_states, position_embedding, past_key_value=past_key_value, use_cache=use_cache, attn_mask=attn_mask)
+            if use_cache:
+                presents.append(present)
+
+        hidden_states = self.norm(hidden_states)
+        
+        return hidden_states, presents

@@ -78,9 +78,10 @@ class MiniMindConfig(PretrainedConfig):
 
 class RMSNorm(nn.Module):
     def __init__(self, dim:int, eps:float=1e-5):
+        super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight == nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
         return torch.rsqrt(x.pow(2).mean(-1, keepdim=True)+self.eps)
@@ -120,6 +121,10 @@ def precompute_freqs_cis(dim:int, end:int=32*1024, rope_base:float=1e6, rope_sca
     return freqs_cos, freqs_sin
     
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """
+    q, k: (b, seq, h, d)
+    cos, sin: (seq, dim)
+    """
     def rotate_half(x):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat([-x2, x1], dim=-1)
@@ -134,7 +139,7 @@ def repeat_kv(x, num_repeats):
     if num_repeats == 1:
         return x
     
-    x = repeat(x, "b seq h d -> b r seq (r h) d", r=num_repeats)
+    x = repeat(x, "b seq h d -> b seq (h r) d", r=num_repeats)
     return x
 
 class Attention(nn.Module):
@@ -148,14 +153,14 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads//self.num_key_value_heads
         self.head_dim = args.hidden_size//args.num_attention_heads
 
-        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads*args.head_dim, bias=False)
-        self.k_proj = nn.Linear(args.hidden_size, args.num_key_value_heads*args.head_dim, bias=False)
-        self.v_proj = nn.Linear(args.hidden_size, args.num_key_value_heads*args.head_dim, bias=False)
-        self.o_proj = nn.Linear(args.num_attention_heads*args.head_dim, args.hidden_size, bias=False)
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads*self.head_dim, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, args.num_key_value_heads*self.head_dim, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, args.num_key_value_heads*self.head_dim, bias=False)
+        self.o_proj = nn.Linear(args.num_attention_heads*self.head_dim, args.hidden_size, bias=False)
 
         self.flash_attn = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attention
 
-    def forward(self, x:torch.Tensor, position_embdding:tuple, past_key_value:Optional[tuple]=None, use_cache:bool=False, attn_mask:Optional[torch.Tensor]=None):
+    def forward(self, x:torch.Tensor, position_embedding:tuple, past_key_value:Optional[tuple]=None, use_cache:bool=False, attn_mask:Optional[torch.Tensor]=None):
         """
         x: (b, seq, dim)
         position_embedding: tuple of (cos, sin) each of shape (seq, dim)
@@ -169,7 +174,7 @@ class Attention(nn.Module):
         k = rearrange(k, "b seq (h d) -> b seq h d", h=self.num_key_value_heads)
         v = rearrange(v, "b seq (h d) -> b seq h d", h=self.num_key_value_heads)
 
-        q, k = apply_rotary_pos_emb(q, k, position_embdding[0], position_embdding[1])
+        q, k = apply_rotary_pos_emb(q, k, position_embedding[0], position_embedding[1])
 
         if past_key_value is not None:
             k = torch.cat([past_key_value[0], k], dim=1)
@@ -190,4 +195,27 @@ class Attention(nn.Module):
             out = torch.matmul(attn_probs, v)
         
         out = rearrange(out, "b h seq d -> b seq (h d)")
-        out = self.o_proj(out) + x
+        out = self.o_proj(out)
+
+        return out, past_kv
+    
+
+def SiLU(x: torch.Tensor):
+    in_type = x.dtype
+    x = x.to(torch.float32)
+    return (x * torch.sigmoid(x)).to(in_type)
+
+class FeedForward(nn.Module):
+    def __init__(self, args:MiniMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:
+            intermediate_size = int(args.hidden_size*8/3)
+            args.intermediate_size = 64*((intermediate_size + 63) // 64)
+
+        self.fc1 = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.fc2 = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.act_fn = SiLU
+
+    def forward(self, x:torch.Tensor):
+        return self.fc2(self.act_fn(self.fc1(x))*self.gate_proj(x))

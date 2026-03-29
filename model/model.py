@@ -1,7 +1,9 @@
 from typing import Optional
+from einops import rearrange, repeat
 from transformers import PretrainedConfig
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
 class MiniMindConfig(PretrainedConfig):
@@ -127,3 +129,65 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k = k * cos.unsqueeze(unsqueeze_dim) + k_embed * sin.unsqueeze(unsqueeze_dim)
 
     return q, k
+
+def repeat_kv(x, num_repeats):
+    if num_repeats == 1:
+        return x
+    
+    x = repeat(x, "b seq h d -> b r seq (r h) d", r=num_repeats)
+    return x
+
+class Attention(nn.Module):
+    def __init__(self, args:MiniMindConfig):
+        super().__init__()
+        self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads else args.num_attention_heads
+        
+        assert args.num_attention_heads % self.num_key_value_heads == 0,"num_attention_heads must be divisible by num_key_value_heads"
+
+        self.n_local_heads = args.num_attention_heads
+        self.n_rep = self.n_local_heads//self.num_key_value_heads
+        self.head_dim = args.hidden_size//args.num_attention_heads
+
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads*args.head_dim, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, args.num_key_value_heads*args.head_dim, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, args.num_key_value_heads*args.head_dim, bias=False)
+        self.o_proj = nn.Linear(args.num_attention_heads*args.head_dim, args.hidden_size, bias=False)
+
+        self.flash_attn = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attention
+
+    def forward(self, x:torch.Tensor, position_embdding:tuple, past_key_value:Optional[tuple]=None, use_cache:bool=False, attn_mask:Optional[torch.Tensor]=None):
+        """
+        x: (b, seq, dim)
+        position_embedding: tuple of (cos, sin) each of shape (seq, dim)
+        past_key_value: tuple of (k, v) each of shape (b, num_heads, seq, head_dim)
+        """
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = rearrange(q, "b seq (h d) -> b seq h d", h=self.n_local_heads)
+        k = rearrange(k, "b seq (h d) -> b seq h d", h=self.num_key_value_heads)
+        v = rearrange(v, "b seq (h d) -> b seq h d", h=self.num_key_value_heads)
+
+        q, k = apply_rotary_pos_emb(q, k, position_embdding[0], position_embdding[1])
+
+        if past_key_value is not None:
+            k = torch.cat([past_key_value[0], k], dim=1)
+            v = torch.cat([past_key_value[1], v], dim=1)
+        past_kv = (k, v) if use_cache else None
+
+        q = rearrange(q, "b seq h d -> b h seq d")
+
+        k = rearrange(repeat_kv(k, self.n_rep), "b seq h d -> b h seq d")
+        v = rearrange(repeat_kv(v, self.n_rep), "b seq h d -> b h seq d")
+
+        if self.flash_attn:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0)
+        else:
+            attn_scores = torch.matmul(q, k.transpose(-2, -1))/math.sqrt(self.head_dim)
+            attn_scores = attn_scores.masked_fill(attn_mask==0, float("-inf")) if attn_mask is not None else attn_scores
+            attn_probs = F.softmax(attn_scores, dim=-1)
+            out = torch.matmul(attn_probs, v)
+        
+        out = rearrange(out, "b h seq d -> b seq (h d)")
+        out = self.o_proj(out) + x

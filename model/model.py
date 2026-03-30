@@ -1,6 +1,6 @@
-from typing import Optional
+from typing import Optional, Union
 from einops import rearrange, repeat
-from transformers import PretrainedConfig
+from transformers import GenerationMixin, PretrainedConfig, PretrainedModel, CasualLMoutputWithPast
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -243,16 +243,17 @@ class Block(nn.Module):
         x = x + self.ffn(self.norm2(x))
         return x, past_kv
     
-class MiniMind(nn.Module):
+class MiniMindModel(nn.Module):
     def __init__(self, config:MiniMindConfig):
         super().__init__()
         self.config = config
-        self.tok_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Block(i, config) for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.output_proj = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.freqs_cos, self.freqs_sin = precompute_freqs_cis(config.hidden_size//config.num_attention_heads, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
-    
+        self.register_buffer("freqs_cos", self.freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", self.freqs_sin, persistent=False)
+
     def forward(self, input_ids:Tensor, position_ids:Optional[Tensor]=None, past_key_values:Optional[list]=None, use_cache:bool=False, attn_mask:Optional[Tensor]=None):
         if hasattr(past_key_values, 'layers'):
             past_key_values = None
@@ -265,7 +266,7 @@ class MiniMind(nn.Module):
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         position_embedding = (self.freqs_cos[start_pos:start_pos+seq], self.freqs_sin[start_pos:start_pos+seq]) if self.freqs_cos is not None else None
 
-        hidden_states = self.tok_embeddings(input_ids)
+        hidden_states = self.embed_tokens(input_ids)
 
         presents = []
 
@@ -278,3 +279,27 @@ class MiniMind(nn.Module):
         hidden_states = self.norm(hidden_states)
         
         return hidden_states, presents
+    
+class MiniMindForCausalLM(PretrainedModel, GenerationMixin):
+    config_class = MiniMindConfig
+    def __init__(self, config:MiniMindConfig):
+        self.config = config
+        super().__init__(config)
+        self.model = MiniMindModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.model.embed_tokens.weight = self.lm_head.weight
+        self.OUT=CasualLMoutputWithPast()
+
+    def forward(self, input_ids:Tensor, 
+                past_key_values:Optional[list]=None, 
+                use_cache:bool=False, 
+                attn_mask:Optional[Tensor]=None,
+                logits_to_keep:Union[int, Tensor]=0):
+        hidden_states, presents = self.model(input_ids, past_key_values=past_key_values, use_cache=use_cache, attn_mask=attn_mask)
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) and logits_to_keep > 0 else slice(None)
+        slice_logits = self.lm_head(hidden_states[:, slice_indices])
+
+        self.OUT.__setitem__("logits", slice_logits)
+        self.OUT.__setitem__("past_key_values", presents if use_cache else None)
+        self.OUT.__setitem__("last_hidden_state", hidden_states)
+        return self.OUT

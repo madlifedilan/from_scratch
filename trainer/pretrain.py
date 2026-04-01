@@ -226,7 +226,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     
     # Data and model loading
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl", help="预训练数据路径")
+    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_t2t.jsonl", help="预训练数据路径")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     
@@ -310,7 +310,7 @@ if __name__ == "__main__":
     train_ds = PreTrainDataset(
         args.data_path,
         tokenizer,
-        max_length=args.max_seq_len
+        max_seq_len=args.max_seq_len
     )
     
     # Setup distributed sampler if using DDP

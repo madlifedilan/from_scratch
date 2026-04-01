@@ -367,7 +367,8 @@ class Attention(nn.Module):
         # Compute attention
         if self.flash_attn:
             # Flash Attention: faster and more memory-efficient
-            is_causal = past_key_value and q.size(2) > 1
+            # For decoder-only LM, attention should be causal unless an explicit mask is provided.
+            is_causal = bool(attn_mask is None)
             out = F.scaled_dot_product_attention(
                 q, k, v, 
                 attn_mask=attn_mask, 
@@ -677,13 +678,27 @@ class myLLMForCausalLM(PreTrainedModel, GenerationMixin):
             attn_mask=attn_mask
         )
         
-        # Get logits for next token prediction
+        # Compute full logits first so loss can be calculated when labels are provided.
+        logits = self.lm_head(hidden_states)
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        # Optionally keep only the last N logits for decoding efficiency.
         keep_num = logits_to_keep.item() if isinstance(logits_to_keep, Tensor) else logits_to_keep
-        slice_indices = slice(-keep_num, None) if keep_num > 0 else slice(None)
-        slice_logits = self.lm_head(hidden_states[:, slice_indices])
+        if keep_num > 0:
+            logits = logits[:, -keep_num:, :]
 
         return CausalLMOutputWithPast(
-            logits=slice_logits,
+            loss=loss,
+            logits=logits,
             past_key_values=past_key_values,
             hidden_states=hidden_states
         )
